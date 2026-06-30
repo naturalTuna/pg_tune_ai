@@ -227,11 +227,27 @@ def cmd_ai(args) -> int:
     else:
         print(report)
 
-    # 항상 로그(ai). 순서: 진단+LLM 제안+검증 리포트 → 프롬프트에 들어간 EXPLAIN
+    # 항상 로그(ai). 순서: 진단+LLM 제안+검증 리포트 → 프롬프트 EXPLAIN → 제안별 before/after
     if log:
         parts = [report]
         if result.get("plan_text"):
-            parts += ["", "=== 프롬프트에 사용된 EXPLAIN (텍스트) ===", result["plan_text"]]
+            parts += ["", "=== 프롬프트에 사용된 EXPLAIN (원본 플랜) ===", result["plan_text"]]
+        # 검증된 제안별 적용 전/후 EXPLAIN
+        ver = result.get("verified", [])
+        blocks = []
+        for i, v in enumerate(ver, 1):
+            eb, ea = v.get("explain_before", ""), v.get("explain_after", "")
+            if not eb and not ea:
+                continue
+            b = [f"--- 제안 {i} [{v.get('type')}] {v.get('detail','')} ---"]
+            if eb:
+                b += ["[before]", eb]
+            if ea:
+                b += ["[after]", ea]
+            blocks.append("\n".join(b))
+        if blocks:
+            parts += ["", "=== 제안별 적용 전/후 EXPLAIN ===", ""]
+            parts.append("\n\n".join(blocks))
         tunelog.write("ai", args.sql, "\n".join(parts), dsn=args.dsn, sql=args.sql)
     return 0
 
