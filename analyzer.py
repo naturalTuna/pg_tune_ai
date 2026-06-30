@@ -217,6 +217,41 @@ def rule_seq_scan_inefficient(node: dict, min_rows: int = 1000) -> Optional[Find
     )
 
 
+# Filter 에서 "함수(컬럼)" 형태를 잡는다: date(created_at), lower(t.name) 등
+# 컬럼 앞에 테이블 별칭이 붙는 경우(VERBOSE)도 허용: date(orders_1.created_at)
+_FUNC_ON_COL = re.compile(
+    r"\b([a-z_]{2,})\s*\(\s*(?:[a-z_][a-z0-9_]*\.)?([a-z_][a-z0-9_]*)\s*\)")
+# 함수가 아니거나(논리/구문) 안티패턴이 아닌 키워드는 제외
+_FUNC_SKIP = {"not", "any", "all", "in", "exists", "and", "or"}
+
+
+def rule_function_on_column(node: dict) -> Optional[Finding]:
+    """WHERE 절 컬럼에 함수가 씌워져(예: date(created_at)=...) 인덱스/파티션
+    프루닝을 무효화하는 안티패턴을 감지한다."""
+    filt = node.get("Filter")
+    if not filt:
+        return None
+    m = _FUNC_ON_COL.search(filt)
+    if not m:
+        return None
+    func, col = m.group(1), m.group(2)
+    if func in _FUNC_SKIP:
+        return None
+    removed = rows_total(node, "Rows Removed by Filter")
+    rel = rel_label(node)
+    return Finding(
+        rule="function_on_column", severity="medium",
+        node_type=node.get("Node Type", "Scan"), relation=rel,
+        message=f"Filter에서 컬럼에 함수 적용: {func}({col}) — 일반 인덱스/파티션 프루닝 무효화",
+        evidence={"function": func, "column": col, "removed": removed,
+                  "filter": filt},
+        suggestion=(f"{func}({col}) 처럼 컬럼에 함수를 씌우면 인덱스를 타지 못하고 "
+                    f"파티션 프루닝도 막힙니다. 범위 조건으로 재작성하세요 "
+                    f"(예: date(col)=X → col >= X AND col < X + 1일). "
+                    f"불가피하면 표현식 인덱스: CREATE INDEX ON {rel} ({func}({col}))."),
+    )
+
+
 def rule_sort_spill(node: dict) -> Optional[Finding]:
     if node.get("Sort Space Type") != "Disk":
         return None
@@ -277,8 +312,8 @@ def rule_low_cache_hit(node: dict, min_blocks: int = 10000) -> Optional[Finding]
 
 
 RULES = [
-    rule_bad_estimate, rule_seq_scan_inefficient, rule_sort_spill,
-    rule_hash_spill, rule_heap_fetches, rule_low_cache_hit,
+    rule_bad_estimate, rule_seq_scan_inefficient, rule_function_on_column,
+    rule_sort_spill, rule_hash_spill, rule_heap_fetches, rule_low_cache_hit,
 ]
 
 
@@ -363,6 +398,41 @@ def dedupe_findings(findings: list) -> list:
     return out
 
 
+def collapse_function_on_column(findings: list, dsn: str | None) -> list:
+    """function_on_column 이 여러 파티션에서 중복 발동하면 (function, column)
+    기준으로 묶어 부모 1건으로 합친다."""
+    fns = [f for f in findings if f.rule == "function_on_column"]
+    if len(fns) <= 1:
+        return findings
+    others = [f for f in findings if f.rule != "function_on_column"]
+
+    groups: dict = {}
+    for f in fns:
+        key = (f.evidence.get("function"), f.evidence.get("column"))
+        groups.setdefault(key, []).append(f)
+
+    merged = []
+    for (func, col), grp in groups.items():
+        if len(grp) == 1:
+            merged.append(grp[0])
+            continue
+        rels = [g.relation for g in grp]
+        parent = partition_parent(dsn, rels[0]) or _common_prefix_parent(rels)
+        removed = sum(g.evidence.get("removed", 0) for g in grp)
+        merged.append(Finding(
+            rule="function_on_column", severity="medium",
+            node_type="Seq Scan", relation=parent,
+            message=f"{len(grp)}개 파티션 Filter에서 컬럼에 함수 적용: {func}({col}) "
+                    f"— 인덱스/파티션 프루닝 무효화",
+            evidence={"function": func, "column": col, "removed": removed,
+                      "partitions": len(grp), "parent": parent},
+            suggestion=(f"{func}({col}) 함수 조건은 인덱스를 못 타고 파티션 프루닝도 "
+                        f"막습니다. 범위 조건으로 재작성하세요 "
+                        f"(예: date(col)=X → col >= X AND col < X + 1일)."),
+        ))
+    return others + merged
+
+
 # ---------------------------------------------------------------------------
 # findings -> 인덱스 후보 도출 (verifier(③)가 hypopg로 검증할 대상)
 # ---------------------------------------------------------------------------
@@ -410,6 +480,7 @@ def analyze_plan(root: dict, dsn: str | None = None) -> dict:
     # 후처리: 파티션 스캔 묶기 + 중복 제거
     findings = dedupe_findings(findings)
     findings = collapse_partitions(findings, dsn)
+    findings = collapse_function_on_column(findings, dsn)
 
     findings.sort(key=lambda f: SEVERITY_ORDER.get(f.severity, 9))
     hotspots.sort(key=lambda h: h["exclusive_ms"], reverse=True)
