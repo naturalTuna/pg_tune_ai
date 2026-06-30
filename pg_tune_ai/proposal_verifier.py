@@ -32,18 +32,34 @@ class VerifiedProposal:
     human_check: bool = False         # rewrite: 결과 동등성 사람 확인 필요
     note: str = ""
     error: str | None = None
+    explain_before: str = ""          # 로그용: 적용 전 EXPLAIN(텍스트)
+    explain_after: str = ""           # 로그용: 적용 후 EXPLAIN(텍스트)
+
+
+def _explain_text(dsn: str, sql: str, pre: str = "") -> str:
+    """plan-only 텍스트 EXPLAIN. pre(SET 등) 적용 후, BEGIN/ROLLBACK 으로 격리."""
+    script = "\\set ON_ERROR_STOP on\nBEGIN;\n"
+    if pre:
+        script += pre.rstrip(";") + ";\n"
+    script += f"EXPLAIN {sql};\nROLLBACK;\n"
+    out = verifier.run_sql(dsn, script)
+    # BEGIN/ROLLBACK 등 잡음 줄 제거하고 플랜 줄만 남긴다
+    keep = [ln for ln in out.splitlines()
+            if ln and ln.strip() not in ("BEGIN", "ROLLBACK", "SET")]
+    return "\n".join(keep).rstrip()
 
 
 def _explain_cost(dsn: str, sql: str, pre: str = "") -> float:
-    """pre(SET 등) 적용 후 sql 의 EXPLAIN 총 cost. BEGIN/ROLLBACK 으로 격리."""
-    script = "BEGIN;\n"
+    """pre(SET 등) 적용 후 sql 의 EXPLAIN 총 cost. BEGIN/ROLLBACK 으로 격리.
+    ON_ERROR_STOP 으로 잘못된 SQL(재작성 환각 등)의 진짜 에러를 표면화한다."""
+    script = "\\set ON_ERROR_STOP on\nBEGIN;\n"
     if pre:
         script += pre.rstrip(";") + ";\n"
     script += f"EXPLAIN (FORMAT JSON) {sql};\nROLLBACK;\n"
-    out = verifier.run_sql(dsn, script)
+    out = verifier.run_sql(dsn, script)   # SQL 오류면 여기서 RuntimeError(psql stderr)
     s, e = out.find("["), out.rfind("]")
     if s == -1 or e == -1:
-        raise RuntimeError(f"EXPLAIN 파싱 실패:\n{out}")
+        raise RuntimeError(f"EXPLAIN 결과를 파싱하지 못함:\n{out}")
     plan = json.loads(out[s:e + 1])[0]["Plan"]
     return float(plan.get("Total Cost", 0.0))
 
@@ -53,15 +69,18 @@ def _pct(base: float | None, new: float | None) -> float:
 
 
 def verify_index(dsn: str, sql: str, p) -> VerifiedProposal:
+    cap: dict = {}
     try:
-        r = verifier.verify_candidate(dsn, sql, p.ddl)
+        r = verifier.verify_candidate(dsn, sql, p.ddl, capture=cap)
     except Exception as e:
         return VerifiedProposal("index", p.ddl, p.rationale, ok=False, error=str(e))
     note = "" if r.adopted_by_planner else "플래너가 채택하지 않음 → 효과 낮음"
     return VerifiedProposal(
         "index", p.ddl, p.rationale, ok=True,
         baseline_cost=r.baseline_cost, proposed_cost=r.indexed_cost,
-        improvement_pct=r.improvement_pct, adopted=r.adopted_by_planner, note=note)
+        improvement_pct=r.improvement_pct, adopted=r.adopted_by_planner, note=note,
+        explain_before=cap.get("before_text", ""),
+        explain_after=cap.get("after_text", ""))
 
 
 def verify_config(dsn: str, sql: str, p, baseline: float | None = None) -> VerifiedProposal:
@@ -70,18 +89,23 @@ def verify_config(dsn: str, sql: str, p, baseline: float | None = None) -> Verif
         base = baseline if baseline is not None else _explain_cost(dsn, sql)
         sets = " ".join(f"SET LOCAL {k} = '{v}';" for k, v in p.set.items())
         new = _explain_cost(dsn, sql, pre=sets)
+        eb = _explain_text(dsn, sql)
+        ea = _explain_text(dsn, sql, pre=sets)
     except Exception as e:
         return VerifiedProposal("config", detail, p.rationale, ok=False, error=str(e))
     return VerifiedProposal(
         "config", detail, p.rationale, ok=True,
         baseline_cost=base, proposed_cost=new, improvement_pct=_pct(base, new),
-        note="cost(추정) 기준. work_mem 등은 런타임 개선이 cost 에 안 드러날 수 있음.")
+        note="cost(추정) 기준. work_mem 등은 런타임 개선이 cost 에 안 드러날 수 있음.",
+        explain_before=eb, explain_after=ea)
 
 
 def verify_rewrite(dsn: str, sql: str, p, baseline: float | None = None) -> VerifiedProposal:
     try:
         base = baseline if baseline is not None else _explain_cost(dsn, sql)
         new = _explain_cost(dsn, p.sql)   # 재작성 SQL 이 일단 계획이 잡히는지도 검증
+        eb = _explain_text(dsn, sql)
+        ea = _explain_text(dsn, p.sql)
     except Exception as e:
         return VerifiedProposal("rewrite", p.sql, p.rationale, ok=False,
                                 human_check=True, error=str(e))
@@ -89,7 +113,8 @@ def verify_rewrite(dsn: str, sql: str, p, baseline: float | None = None) -> Veri
         "rewrite", p.sql, p.rationale, ok=True,
         baseline_cost=base, proposed_cost=new, improvement_pct=_pct(base, new),
         human_check=True,
-        note="⚠ 결과 동등성 미검증 — 원본과 같은 결과를 내는지 직접 비교 필요.")
+        note="⚠ 결과 동등성 미검증 — 원본과 같은 결과를 내는지 직접 비교 필요.",
+        explain_before=eb, explain_after=ea)
 
 
 def verify_all(dsn: str, sql: str, proposals: list) -> list:
