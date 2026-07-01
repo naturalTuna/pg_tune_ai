@@ -56,8 +56,10 @@ def run(dsn: str, sql: str, *,
     except Exception:
         plan_text = ""
 
-    # 3) 프롬프트 조립 (텍스트만 — DB 접근 없음)
-    p = ai_prompt.build(sql, plan_text, diagnosis.get("findings", []))
+    # 3) 프롬프트 조립 (텍스트만 — DB 접근 없음). 핫스팟으로 진짜 범인 식별 유도.
+    p = ai_prompt.build(sql, plan_text,
+                        diagnosis.get("findings", []),
+                        hotspots=diagnosis.get("hotspots", []))
 
     # 4) LLM 호출 (텍스트 in / 텍스트 out — DB 접근 없음)
     if not llm_client.health(host):
