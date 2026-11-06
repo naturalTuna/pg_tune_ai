@@ -14,6 +14,8 @@ pgtune.py  —  통합 진입점 (규칙엔진 기반 PostgreSQL 튜닝 도구)
   verify        인덱스 후보를 hypopg로 검증
   index-check   DB 전체 인덱스 상태 점검 (안 쓰는/중복/비대)
   tune          ★ analyze + 후보 자동 검증을 한 번에 (검증된 추천만 제시)
+  ai            analyze + 로컬 LLM(Ollama) 제안 + 검증  ※ 선택 기능
+                (Ollama 가 없어도 나머지 서브커맨드는 그대로 동작)
 
 사용 예
 ------
