@@ -10,6 +10,7 @@ Ollama가 없어도 `analyze` / `verify` / `index-check` / `tune`은 그대로 �
 - Python 3.7+ 표준 라이브러리만 사용 (pip 의존성 없음 → 폐쇄망 OK)
 - DB 접속은 `psql` 명령을 사용 (PATH에 있어야 함)
 - `verify` / `tune` / `ai` 검증은 대상 DB에 `hypopg` extension 필요
+  (hypopg 가 없으면 후보를 "미채택"으로 판정하지 않고 **"검증 불가"** 로 표시합니다)
 
 ---
 

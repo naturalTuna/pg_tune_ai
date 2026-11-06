@@ -149,9 +149,18 @@ def cmd_index_check(args) -> int:
 # ---------------------------------------------------------------------------
 # tune : 진단 → 후보 도출 → 자동 검증 (전체 파이프라인 한 번에)
 # ---------------------------------------------------------------------------
-def _tune_text_report(res: dict, verified: list) -> str:
-    """tune 사람용 통합 리포트 텍스트를 구성 (출력/로그 공용)."""
+def _tune_text_report(res: dict, verified: list, failed: list | None = None) -> str:
+    """tune 사람용 통합 리포트 텍스트를 구성 (출력/로그 공용).
+    failed: 검증 자체가 실패한 후보 [(ddl, 사유)] — '미채택' 과 구분해서 표시."""
     lines = [analyzer.format_report(res), "", "=== 검증된 추천 (hypopg) ==="]
+    if failed:
+        for ddl, why in failed:
+            lines.append(f"후보: {ddl}")
+            lines.append(f"  ⚠ 검증 불가: {why}")
+        if not verified:
+            lines += ["", "→ 후보를 검증하지 못했습니다. 위 사유 해결 후 다시 실행하세요 "
+                          "(미채택이 아니라 '검증 안 됨' 입니다)."]
+            return "\n".join(lines)
     if not verified:
         lines.append("  검증할 인덱스 후보가 없습니다. (인덱스로 개선 어려운 쿼리이거나, "
                      "설정/구조 튜닝이 필요한 경우)")
@@ -176,14 +185,21 @@ def cmd_tune(args) -> int:
     res = analyzer.analyze_plan(root, dsn=getattr(args, "dsn", None))
 
     # 2) 후보를 각각 hypopg로 검증 (검증 EXPLAIN 은 capture 로 수집; 로그 시에만)
-    verified, captures = [], []
+    verified, captures, failed = [], [], []
     for cand in res["index_candidates"]:
         cap: dict | None = {} if log else None
-        verified.append(verifier.verify_candidate(args.dsn, args.sql, cand["ddl"], capture=cap))
-        captures.append(cap)
+        try:
+            verified.append(verifier.verify_candidate(args.dsn, args.sql, cand["ddl"], capture=cap))
+            captures.append(cap)
+        except verifier.HypopgMissing as e:
+            # hypopg 가 없으면 나머지 후보도 전부 같은 이유로 실패 → 한 번에 표시
+            failed = [(c["ddl"], str(e)) for c in res["index_candidates"][len(verified):]]
+            break
+        except RuntimeError as e:
+            failed.append((cand["ddl"], str(e).splitlines()[-1] if str(e) else "오류"))
 
     # 사람용 통합 리포트는 항상 구성 (출력 또는 로그용) — 진단 + 검증된 추천
-    report = _tune_text_report(res, verified)
+    report = _tune_text_report(res, verified, failed)
 
     # 3) 출력
     if args.format == "json":
