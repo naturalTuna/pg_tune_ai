@@ -73,6 +73,20 @@ def explain_text(dsn: str, sql: str) -> str:
     return run_sql(dsn, f"EXPLAIN {sql};").rstrip("\n")
 
 
+def hypopg_available(dsn: str) -> bool:
+    """대상 DB 에 hypopg extension 이 설치(CREATE EXTENSION)돼 있는지."""
+    out = run_sql(dsn, "SELECT count(*) FROM pg_extension WHERE extname = 'hypopg';")
+    return out.strip() == "1"
+
+
+class HypopgMissing(RuntimeError):
+    """hypopg 미설치 — 가상 인덱스 검증 자체가 불가능한 상태."""
+
+
+HYPOPG_MISSING_MSG = ("hypopg extension 미설치 — 가상 인덱스 검증 불가. "
+                      "대상 DB 에서 CREATE EXTENSION hypopg; 후 다시 실행하세요.")
+
+
 def top_cost(plan: dict) -> float:
     """루트 노드의 Total Cost = 쿼리 전체 추정 비용."""
     return float(plan.get("Total Cost", 0.0))
@@ -104,6 +118,10 @@ def main_scan(plan: dict) -> str:
 def verify_candidate(dsn: str, sql: str, index_ddl: str,
                      capture: Optional[dict] = None) -> VerifyResult:
     # capture(dict)를 넘기면 before/after 원본 플랜을 담아준다 (로그 기록용).
+    # 0) hypopg 확인 — 없으면 hypopg_create_index 가 실패한 채로 EXPLAIN 만 돌아
+    #    "미채택(효과 없음)" 으로 잘못 판정되므로 먼저 막는다.
+    if not hypopg_available(dsn):
+        raise HypopgMissing(HYPOPG_MISSING_MSG)
     # 1) 원본
     before = explain_json(dsn, sql)
     base_cost = top_cost(before)
@@ -117,6 +135,7 @@ def verify_candidate(dsn: str, sql: str, index_ddl: str,
     dollar = f"$pgtune${index_ddl}$pgtune$"
     M_TXT, M_JSON = "__PGT_AFTER_TXT__", "__PGT_AFTER_JSON__"
     script = (
+        "\\set ON_ERROR_STOP on\n"          # 가상 인덱스 생성 실패 시 즉시 오류로 처리
         f"SELECT hypopg_create_index({dollar});\n"
         f"SELECT '{M_TXT}';\n"
         f"EXPLAIN {sql};\n"
