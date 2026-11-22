@@ -46,6 +46,27 @@ class FilterParseTest(unittest.TestCase):
         self.assertEqual(out[0].ddl, "CREATE INDEX ON orders (status)")
 
 
+class CandidateExtraTest(unittest.TestCase):
+    def test_expression_index_candidate(self):
+        f = a.Finding("function_on_column", "medium", "Seq Scan", "orders", "", {
+            "function": "date", "column": "created_at", "filter": "x"}, "")
+        c = a.derive_index_candidates([f])
+        self.assertEqual([x.ddl for x in c], ["CREATE INDEX ON orders ((date(created_at)))"])
+        self.assertEqual(a.validate_candidates(c, {"orders": {"id": "integer"}})[0].ddl,
+                         "CREATE INDEX ON orders ((date(created_at)))")
+
+    def test_recommended_indexes_dedupe_prefix(self):
+        import pgtune
+        from verifier import VerifyResult
+        def v(ddl, pct):
+            return VerifyResult(ddl, 100.0, 100.0 * (1 - pct / 100), True, "Seq Scan", "Index Scan", pct)
+        rec = pgtune.recommended_indexes([v('CREATE INDEX ON orders ("Region")', 99.0),
+                                          v('CREATE INDEX ON orders ("Region", amt)', 99.4),
+                                          v("CREATE INDEX ON customers (grade)", 80.0)])
+        self.assertEqual([r.index_ddl for r in rec],
+                         ['CREATE INDEX ON orders ("Region", amt)', "CREATE INDEX ON customers (grade)"])
+
+
 class RuleTest(unittest.TestCase):
     def test_function_on_column_rhs_not_flagged(self):
         node = {"Node Type": "Seq Scan", "Relation Name": "t", "Filter": "((name)::text = upper('abc'::text))"}

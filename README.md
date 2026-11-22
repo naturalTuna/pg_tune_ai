@@ -134,12 +134,33 @@ GitHub Actions 에서 PostgreSQL 16 + hypopg 로 자동 실행됩니다.
 
 ## 다른 도구와의 차이
 
-| | pg_tune_ai | Dexter | pg_qualstats + PoWA | explain.dalibo (pev2) |
+### 실측: pg_qualstats 인덱스 추천과 비교 (`bench/`)
+같은 DB(orders 30만 행, customers 2만 행, PostgreSQL 16)에 쿼리 6개. 각 도구가 추천한 인덱스를 **실제로 만들어** 실행시간(ms, 3회 중 최소) 측정.
+
+| 쿼리 | 기준 | pg_tune_ai | pg_qualstats_index_advisor |
+|---|---|---|---|
+| Q1 `status = 'A'` (varchar) | 14.11 | 3.76 | 3.68 |
+| Q2 `cust_id = ? ORDER BY created_at DESC LIMIT 10` | 13.18 | 0.19 | 0.19 |
+| Q3 `"Region" = 3 AND amt > 990` | 14.54 | 0.09 | 0.10 |
+| Q4 `JOIN customers ... grade = 'V'` | 25.84 | 3.32 | 3.34 |
+| Q5 `date(created_at) = ...` | 15.15 | **0.23** (표현식 인덱스 검증) | 16.69 (추천 없음) |
+| Q6 `note LIKE '%abc1%'` | 24.56 | 24.97 (진단: pg_trgm GIN 권고) | 24.46 (최적화 불가로 표시) |
+
+- 일반 B-tree 후보 4개는 두 도구 추천이 같음
+- pg_tune_ai 만: 표현식 인덱스(hypopg 검증), 규칙 진단(함수/LIKE/캐스트 등)과 쿼리 수정 권고, pg_hint_plan / SET 실험
+- pg_qualstats 만: **워크로드 전체**(실제 실행된 조건절 통계)를 보고 한 번에 추천, 쿼리를 하나씩 줄 필요 없음
+- 둘 다 못 함: trigram GIN 검증 (hypopg 가 GIN 미지원)
+
+### 기능 비교
+
+| | pg_tune_ai | Dexter | pg_qualstats (+ PoWA) | explain.dalibo (pev2) |
 |---|---|---|---|---|
 | 입력 | 쿼리 1건 (+ 플랜 파일) | 로그 / pg_stat_statements 워크로드 | 실행된 조건절 통계 | 플랜 1건 |
-| 인덱스 검증 | hypopg | hypopg | hypopg | - |
+| 인덱스 검증 | hypopg (표현식 포함) | hypopg | hypopg (PoWA) | - |
 | 실행계획 대안 / 설정 실험 | pg_hint_plan, SET | - | - | - |
+| 진단 규칙 / 쿼리 수정 권고 | 15종 | - | - | 시각화 |
 | SQL 파싱 | 플랜 문자열 + 카탈로그 검증 | pg_query (실제 파서) | 서버 통계 | - |
-| 폐쇄망 / 의존성 | 표준 라이브러리 + psql | Ruby gem | 서버 extension 2개 + 웹 | 웹 |
+| 폐쇄망 / 의존성 | 표준 라이브러리 + psql | Ruby gem | 서버 extension (preload 필요) + 웹 | 웹 |
 
-워크로드 단위(Top N 쿼리 일괄) 분석은 아직 없습니다 — 다음 개선 후보.
+(Dexter 는 이 환경에서 rubygems 접근이 막혀 실측하지 못함)
+워크로드 단위(Top N 쿼리 일괄) 분석은 아직 없음 — pg_qualstats 대비 다음 개선 후보.

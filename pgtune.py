@@ -24,6 +24,7 @@ pgtune.py  —  규칙 기반 PostgreSQL 쿼리 튜닝 (AI 없음, 표준 라이
 from __future__ import annotations
 import argparse
 import json
+import re
 import sys
 from dataclasses import asdict
 
@@ -58,11 +59,28 @@ def _verify_indexes(dsn, sql, cands):
     return verified, failed
 
 
+_DDL_RE = re.compile(r"^CREATE INDEX ON\s+(\S+)\s*(?:USING\s+\w+\s*)?\((.*)\)$", re.I | re.S)
+
+
+def recommended_indexes(verified) -> list:
+    """채택된 후보 중 추천할 것만. 개선율 높은 순으로 보면서, 같은 테이블에 같은 선두 키를 가진
+    인덱스가 이미 추천됐으면 뺀다 (예: ("Region", amt) 를 추천했으면 ("Region") 단독은 중복)."""
+    out, lead = [], set()
+    for v in sorted([v for v in verified if v.adopted_by_planner and v.improvement_pct > 5],
+                    key=lambda v: (-v.improvement_pct, -len(v.index_ddl))):
+        m = _DDL_RE.match(v.index_ddl.strip())
+        key = (m.group(1), m.group(2).split(",")[0].strip()) if m else (v.index_ddl, "")
+        if key in lead:
+            continue
+        lead.add(key)
+        out.append(v)
+    return out
+
+
 def _summary(res, stats, verified, exps) -> list:
     """우선순위 추천: 근본 원인(인덱스/쿼리/통계) → 설정 → 힌트(최후 수단)."""
     recs = []
-    for v in sorted([v for v in verified if v.adopted_by_planner and v.improvement_pct > 5],
-                    key=lambda v: -v.improvement_pct):
+    for v in recommended_indexes(verified):
         recs.append(("인덱스", f"{v.index_ddl};  (cost {v.improvement_pct:.0f}% 감소, "
                                 f"{v.scan_before} → {v.scan_after})"))
     rewrite = {"function_on_column", "implicit_cast_on_column", "like_leading_wildcard",
@@ -126,6 +144,7 @@ def cmd_tune(a) -> int:
     if a.format == "json":
         print(json.dumps({"diagnosis": res, "stats": stats,
                           "index_verified": [asdict(v) for v in verified],
+                          "recommended_indexes": [v.index_ddl for v in recommended_indexes(verified)],
                           "index_failed": failed, "experiments": exps},
                          ensure_ascii=False, indent=2, default=str))
     else:

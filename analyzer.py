@@ -256,11 +256,13 @@ def sort_key_columns(keys: list, alias: Optional[str] = None) -> list:
 
 
 def _col_name(c: str) -> str:
-    """'created_at DESC' → 'created_at'"""
+    """'created_at DESC' → 'created_at'  ('(date(x))' 같은 표현식은 그대로)"""
     return re.sub(r"\s+(DESC|ASC)$", "", c, flags=re.I)
 
 
 def _col_sql(c: str) -> str:
+    if c.startswith("("):            # 표현식 인덱스 키는 이미 SQL 형태
+        return c
     base = _col_name(c)
     return quote_ident(base) + c[len(base):]
 
@@ -680,6 +682,10 @@ def derive_index_candidates(findings: list) -> list:
             eq = equality_columns(ev.get("filter"))
             keys = [k for k in ev.get("sort_key", []) if _col_name(k) not in eq]
             add(rel, eq + keys, f"LIMIT 을 위한 {ev.get('rows_sorted', 0):,}행 정렬 제거")
+        elif f.rule == "function_on_column" and ev.get("function") and ev.get("column"):
+            # 쿼리를 못 고칠 때의 대안: 표현식 인덱스 — hypopg 로 실제 채택되는지 검증 (함수가 IMMUTABLE 이어야 생성 가능)
+            add(rel, [f"({ev['function']}({quote_ident(ev['column'])}))"],
+                f"컬럼에 {ev['function']}() 적용 — 쿼리 재작성이 안 될 때의 표현식 인덱스 대안")
         elif f.rule == "nested_loop_many_loops" and f.relation:
             jcols = _join_key_for_alias(ev.get("join_filter"), ev.get("inner_alias")) \
                 or extract_filter_columns(ev.get("inner_filter"))
@@ -764,7 +770,7 @@ def validate_candidates(cands: list, columns: dict) -> list:
         if cols is None:
             out.append(c)
             continue
-        keep = [x for x in c.columns if _col_name(x) in cols]
+        keep = [x for x in c.columns if x.startswith("(") or _col_name(x) in cols]
         if not keep:
             continue
         if keep != c.columns:
