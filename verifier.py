@@ -103,6 +103,25 @@ def uses_hypothetical(plan: dict) -> bool:
     return any(uses_hypothetical(c) for c in plan.get("Plans", []))
 
 
+def scan_on(plan: dict, rel: str) -> str:
+    """후보 테이블(rel)을 읽는 노드 타입. 없으면 main_scan."""
+    name = rel.split(".")[-1]
+    stack = [plan]
+    while stack:
+        n = stack.pop(0)
+        if n.get("Relation Name") == name and n.get("Node Type") != "ModifyTable":
+            return n.get("Node Type", "Unknown")
+        if n.get("Node Type") == "Bitmap Index Scan" and name in str(n.get("Index Name", "")):
+            return "Bitmap Index Scan"
+        stack.extend(n.get("Plans", []))
+    return main_scan(plan)
+
+
+def _ddl_rel(ddl: str) -> str:
+    m = re.search(r"\bON\s+([^\s(]+)", ddl, re.I)
+    return m.group(1) if m else ""
+
+
 def main_scan(plan: dict) -> str:
     """플랜에서 가장 바깥의 의미 있는 스캔/노드 타입을 뽑는다 (표시용)."""
     skip = {"Gather", "Gather Merge", "Result", "Append", "Sort", "Limit"}
@@ -125,7 +144,7 @@ def verify_candidate(dsn: str, sql: str, index_ddl: str,
     # 1) 원본
     before = explain_json(dsn, sql)
     base_cost = top_cost(before)
-    scan_before = main_scan(before)
+    scan_before = scan_on(before, _ddl_rel(index_ddl))
     # 로그용 텍스트 EXPLAIN(원본)은 capture 요청 시에만 추가로 받아온다
     before_text = explain_text(dsn, sql) if capture is not None else ""
 
@@ -157,7 +176,7 @@ def verify_candidate(dsn: str, sql: str, index_ddl: str,
 
     indexed_cost = top_cost(after)
     adopted = uses_hypothetical(after)
-    scan_after = main_scan(after)
+    scan_after = scan_on(after, _ddl_rel(index_ddl))
     improvement = (1 - indexed_cost / base_cost) * 100 if base_cost else 0.0
 
     if capture is not None:

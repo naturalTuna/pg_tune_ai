@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+pgtune_log/
+*.egg-info/
+build/
+dist/

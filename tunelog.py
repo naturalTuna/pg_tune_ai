@@ -26,7 +26,7 @@ from datetime import datetime
 LOG_DIR = "pgtune_log"
 
 # 서브커맨드 → 파일명 접두(라벨)
-KIND_LABEL = {"analyze": "analyze", "verify": "verify", "tune": "tune"}
+KIND_LABEL = {"analyze": "analyze", "verify": "verify", "tune": "tune", "hint": "hint"}
 
 
 def query_id(source: str | None) -> str:
