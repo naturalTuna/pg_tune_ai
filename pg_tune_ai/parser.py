@@ -13,6 +13,8 @@ import json
 import re
 from dataclasses import dataclass
 
+import sqlguard
+
 VALID_TYPES = {"index", "rewrite", "config"}
 
 
@@ -73,11 +75,21 @@ def parse(text: str) -> tuple[list[Proposal], list[str]]:
             if not isinstance(ddl, str) or "create index" not in ddl.lower():
                 warnings.append(f"proposals[{i}](index): 유효한 ddl 없음 — 건너뜀")
                 continue
+            try:
+                ddl = sqlguard.index_ddl(ddl)
+            except sqlguard.SqlGuardError as e:
+                warnings.append(f"proposals[{i}](index): 보안 검사 실패 — {e} — 건너뜀")
+                continue
             out.append(Proposal("index", rationale, ddl=ddl.strip()))
         elif t == "rewrite":
             s = item.get("sql")
             if not isinstance(s, str) or not s.strip():
                 warnings.append(f"proposals[{i}](rewrite): 유효한 sql 없음 — 건너뜀")
+                continue
+            try:
+                s = sqlguard.readonly_query(s)
+            except sqlguard.SqlGuardError as e:
+                warnings.append(f"proposals[{i}](rewrite): 보안 검사 실패 — {e} — 건너뜀")
                 continue
             out.append(Proposal("rewrite", rationale, sql=s.strip()))
         elif t == "config":
@@ -85,6 +97,10 @@ def parse(text: str) -> tuple[list[Proposal], list[str]]:
             if not isinstance(st, dict) or not st:
                 warnings.append(f"proposals[{i}](config): 유효한 set 없음 — 건너뜀")
                 continue
-            out.append(Proposal("config", rationale,
-                                set={str(k): str(v) for k, v in st.items()}))
+            try:
+                clean = dict(sqlguard.guc_setting(k, v) for k, v in st.items())
+            except sqlguard.SqlGuardError as e:
+                warnings.append(f"proposals[{i}](config): 보안 검사 실패 — {e} — 건너뜀")
+                continue
+            out.append(Proposal("config", rationale, set=clean))
     return out, warnings

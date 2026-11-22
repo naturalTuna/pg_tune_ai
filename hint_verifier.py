@@ -148,10 +148,10 @@ def run_setting(dsn: str, sql: str, set_sql: str, target: str, base: dict) -> Ex
 def indexed_leading_cols(dsn: str, rel: str) -> set:
     """rel 에 이미 있는 인덱스들의 선두 컬럼."""
     try:
-        out = analyzer.run_psql(dsn, f"""
+        out = analyzer.run_psql(dsn, """
 SELECT a.attname FROM pg_index i
 JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0]
-WHERE i.indrelid = '{rel}'::regclass;""")
+WHERE i.indrelid = to_regclass(:'rel');""", {"rel": rel})
         return {ln.strip() for ln in out.splitlines() if ln.strip()}
     except Exception:
         return set()

@@ -41,7 +41,7 @@ SELECT coalesce(json_agg(t), '[]') FROM (
          coalesce(to_char(greatest(s.last_vacuum, s.last_autovacuum),'YYYY-MM-DD HH24:MI'),'없음') AS last_vacuum,
          pg_size_pretty(pg_total_relation_size(c.oid)) AS size
   FROM pg_class c LEFT JOIN pg_stat_all_tables s ON s.relid = c.oid
-  WHERE c.oid::regclass::text = ANY (ARRAY[%s])
+  WHERE c.oid IN (SELECT to_regclass(r) FROM jsonb_array_elements_text(:'rels'::jsonb) r)
 ) t;
 """
 
@@ -49,8 +49,7 @@ SELECT coalesce(json_agg(t), '[]') FROM (
 def check(dsn: str, relations: list) -> list:
     if not relations:
         return []
-    arr = ",".join("'" + r.replace("'", "''") + "'" for r in relations)
-    rows = json.loads(analyzer.run_psql(dsn, Q % arr).strip() or "[]")
+    rows = json.loads(analyzer.run_psql(dsn, Q, {"rels": json.dumps(relations)}).strip() or "[]")
     out = []
     for r in rows:
         issues, actions = [], []

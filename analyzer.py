@@ -14,9 +14,12 @@ analyzer.py  —  쿼리 진단 엔진 (EXPLAIN 플랜 규칙 분석)
 from __future__ import annotations
 import json
 import re
-import subprocess
 from dataclasses import dataclass, asdict, field
 from typing import Iterator, Optional
+
+import pgexec
+import sqlguard
+from sqlguard import quote_ident, unquote_ident
 
 SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2, "info": 3}
 
@@ -50,20 +53,14 @@ class HintExperiment:
 
 
 # ---------------------------------------------------------------------------
-# psql
+# psql  (실행은 pgexec 공통부 — 비번 argv 비노출, timeout, ON_ERROR_STOP)
 # ---------------------------------------------------------------------------
-def run_psql(dsn: str, script: str) -> str:
-    # ON_ERROR_STOP: 중간 명령(LOAD 등)이 실패해도 psql 이 0 으로 끝나는 것을 막음
-    proc = subprocess.run(["psql", dsn, "-At", "-X", "-q", "-v", "ON_ERROR_STOP=1"],
-                          input=script, capture_output=True, text=True)
-    if proc.returncode != 0:
-        raise RuntimeError(f"psql 실패:\n{proc.stderr.strip()}")
-    return proc.stdout
+def run_psql(dsn: str, script: str, variables: Optional[dict] = None) -> str:
+    return pgexec.run_psql(dsn, script, variables)
 
 
 def is_dml(sql: str) -> bool:
-    first = sql.lstrip().split(None, 1)[0].upper() if sql.strip() else ""
-    return first in {"INSERT", "UPDATE", "DELETE", "MERGE"}
+    return sqlguard.is_dml(sql)
 
 
 def _json_from(out: str) -> dict:
@@ -73,17 +70,32 @@ def _json_from(out: str) -> dict:
     return json.loads(out[s:e + 1])[0]
 
 
+def _check_hint(hint: str) -> str:
+    if not hint:
+        return ""
+    if "*/" in hint or "/*" in hint or ";" in hint or "\\" in hint:
+        raise sqlguard.SqlGuardError("힌트에 주석 기호 / ';' / 역슬래시는 쓸 수 없음")
+    return hint
+
+
+def explain_script(sql: str, analyze: bool, opts: str, prefix: str = "", hint: str = "") -> str:
+    """EXPLAIN 스크립트 생성. 대상 SQL 은 반드시 한 문장(sqlguard), 결과는 항상 ROLLBACK.
+      - DML        : BEGIN ... ROLLBACK         (ANALYZE 해도 변경은 남지 않음)
+      - 그 외 전부  : BEGIN READ ONLY ... ROLLBACK (WITH ... DELETE 같은 숨은 쓰기도 에러로 차단)
+    prefix(LOAD/SET) 는 내부에서 만든 문장만 넣는다."""
+    stmt = sqlguard.single_statement(sql)
+    h = f"/*+ {_check_hint(hint)} */ " if hint else ""
+    body = f"EXPLAIN {opts}{h}{stmt};"
+    pre = (prefix.rstrip() + "\n") if prefix else ""
+    return pre + pgexec.wrap_tx(body, readonly=not sqlguard.is_dml(stmt))
+
+
 def explain_json(dsn: str, sql: str, analyze: bool, prefix: str = "", hint: str = "") -> dict:
     """EXPLAIN JSON 1회. prefix: 같은 세션에서 먼저 실행할 SQL (LOAD/SET 등).
-    hint: pg_hint_plan 힌트 (/*+ ... */ 로 감쌈). ANALYZE + DML 이면 ROLLBACK."""
-    opts = "ANALYZE, BUFFERS, VERBOSE, SETTINGS, FORMAT JSON" if analyze \
-        else "VERBOSE, SETTINGS, FORMAT JSON"
-    h = f"/*+ {hint} */ " if hint else ""
-    body = f"EXPLAIN ({opts}) {h}{sql};"
-    wrap = analyze and is_dml(sql)
-    script = (prefix + "\n" if prefix else "") + \
-             (f"BEGIN;\n{body}\nROLLBACK;\n" if wrap else body + "\n")
-    return _json_from(run_psql(dsn, script))
+    hint: pg_hint_plan 힌트 (/*+ ... */ 로 감쌈)."""
+    opts = "(ANALYZE, BUFFERS, VERBOSE, SETTINGS, FORMAT JSON) " if analyze \
+        else "(VERBOSE, SETTINGS, FORMAT JSON) "
+    return _json_from(run_psql(dsn, explain_script(sql, analyze, opts, prefix, hint)))
 
 
 def get_plan_from_db(dsn: str, sql: str, analyze: bool = True) -> dict:
@@ -92,9 +104,7 @@ def get_plan_from_db(dsn: str, sql: str, analyze: bool = True) -> dict:
 
 def get_plan_text(dsn: str, sql: str, analyze: bool = False) -> str:
     opts = "(ANALYZE, BUFFERS) " if analyze else ""
-    explain = f"EXPLAIN {opts}{sql}"
-    script = f"BEGIN;\n{explain};\nROLLBACK;\n" if (analyze and is_dml(sql)) else f"{explain};\n"
-    out = run_psql(dsn, script)
+    out = run_psql(dsn, explain_script(sql, analyze, opts))
     lines = [ln for ln in out.splitlines() if ln.strip() not in {"BEGIN", "ROLLBACK", "COMMIT"}]
     return "\n".join(lines).rstrip("\n")
 
@@ -137,8 +147,7 @@ def qual_rel(node: dict) -> Optional[str]:
     r = node.get("Relation Name")
     if not r:
         return None
-    s = node.get("Schema")
-    return f"{s}.{r}" if s and s != "public" else r
+    return sqlguard.qualify(node.get("Schema"), r)
 
 
 def node_loops(node: dict) -> int:
@@ -163,50 +172,97 @@ def has_actual(root_plan: dict) -> bool:
     return "Actual Rows" in root_plan
 
 
-# "(customer_id = 12345)" / "(o.status = 'paid'::text)" → 컬럼 추출
-_COL = re.compile(r"(?:\b[a-z_][a-z0-9_]*\.)?\b([a-z_][a-z0-9_]*)\b\)?(?:::[a-z ]+)?\s*(?:=|<|>|<=|>=|<>|!=|~~|IS\b|LIKE|IN\b|BETWEEN|= ANY)")
-_EQ_COL = re.compile(r"(?:\b[a-z_][a-z0-9_]*\.)?\b([a-z_][a-z0-9_]*)\b\s*=\s*(?!\(?\s*[a-z_][a-z0-9_]*\.)")
-_SKIP_WORDS = {"and", "or", "not", "is", "null", "true", "false", "any", "all", "text",
-               "numeric", "integer", "bigint", "date", "timestamp", "character", "varying"}
+# ---------------------------------------------------------------------------
+# 조건식 파싱 (플랜의 Filter / Index Cond / Join Filter 문자열)
+#   - 문자열 리터럴 내용 제거, 형변환(::type) 제거, (col) 괄호 벗기기
+#   - 따옴표 식별자 / 대소문자 식별자 지원:  ("Region" = 3)
+#   - ((status)::text = 'A'::text) 에서 'text' 를 컬럼으로 잡던 문제 해결
+# ---------------------------------------------------------------------------
+_ID = r'(?:"(?:[^"]|"")+"|[A-Za-z_][A-Za-z0-9_$]*)'
+_TYPE = (r'(?:timestamp(?:\(\d\))?\s+with(?:out)?\s+time\s+zone|time(?:\(\d\))?\s+with(?:out)?\s+time\s+zone|'
+         r'character\s+varying|double\s+precision|bit\s+varying|"[^"]+"|[A-Za-z_][\w.]*)')
+_CAST = re.compile(r'::\s*' + _TYPE + r'(?:\(\d+(?:\s*,\s*\d+)?\))?(?:\[\])*', re.I)
+_PAREN1 = re.compile(r'(?<![\w"$])\(\s*((?:' + _ID + r'\s*\.\s*)?' + _ID + r')\s*\)')
+_OPS = r'(=|<>|!=|<=|>=|<|>|!~~\*?|~~\*?|~\*?|\bIS\b|\bLIKE\b|\bILIKE\b|\bIN\b|\bBETWEEN\b)'
+_COLREF = re.compile(r'(?<![\w"$.])(?:(' + _ID + r')\s*\.\s*)?(' + _ID + r')\s*' + _OPS + r'\s*(.?)', re.I)
+_SKIP_WORDS = {"and", "or", "not", "is", "null", "true", "false", "any", "all", "some", "array",
+               "case", "when", "then", "else", "end", "in", "like", "ilike", "between", "exists"}
+
+
+def normalize_cond(expr: Optional[str]) -> str:
+    if not expr:
+        return ""
+    try:
+        s = sqlguard.code_only(expr)          # '...' 내용 → 공백
+    except sqlguard.SqlGuardError:
+        s = expr
+    s = re.sub(r"'\s*'", "'?'", s)
+    prev = None
+    while prev != s:
+        prev = s
+        s = _CAST.sub("", s)
+        s = _PAREN1.sub(r"\1", s)
+    return s
+
+
+def cond_refs(expr: Optional[str]) -> list:
+    """[(alias|None, column, op, is_equality_filter)] — 컬럼 비교만."""
+    out = []
+    s = normalize_cond(expr)
+    for m in _COLREF.finditer(s):
+        alias, col, op, rhs = m.group(1), m.group(2), m.group(3).upper(), m.group(4)
+        c = unquote_ident(col)
+        if not col.startswith('"') and c.lower() in _SKIP_WORDS:
+            continue
+        # 오른쪽이 다른 컬럼이면 조인 조건 → equality 필터로 보지 않음
+        rhs_is_col = bool(re.match(r'[A-Za-z_"]', rhs or "")) and not re.match(
+            r'(?i)(ANY|ALL|NULL|TRUE|FALSE|NOT)\b', s[m.end(4) - 1:m.end(4) + 5])
+        eq = op == "=" and not rhs_is_col
+        out.append((unquote_ident(alias) if alias else None, c, op, eq))
+    return out
 
 
 def extract_filter_columns(expr: Optional[str]) -> list:
-    if not expr:
-        return []
-    cols, seen = [], set()
-    for m in _COL.finditer(expr):
-        c = m.group(1)
-        if c.lower() in _SKIP_WORDS or c in seen:
-            continue
-        seen.add(c)
-        cols.append(c)
+    cols = []
+    for _, c, _, _ in cond_refs(expr):
+        if c not in cols:
+            cols.append(c)
     return cols
 
 
 def equality_columns(expr: Optional[str]) -> list:
-    """= 조건 컬럼만 (복합 인덱스 선두에 둘 컬럼)."""
-    if not expr:
-        return []
+    """= 조건 컬럼만 (복합 인덱스 선두에 둘 컬럼). col = ANY(...) (IN 리스트) 포함."""
     out = []
-    for m in _EQ_COL.finditer(expr):
-        c = m.group(1)
-        if c.lower() not in _SKIP_WORDS and c not in out:
+    for _, c, _, eq in cond_refs(expr):
+        if eq and c not in out:
             out.append(c)
     return out
+
+
+_SORTKEY = re.compile(r'^(?:(' + _ID + r')\s*\.\s*)?(' + _ID + r')(\s+(?:DESC|ASC))?(\s+NULLS\s+(?:FIRST|LAST))?$', re.I)
 
 
 def sort_key_columns(keys: list, alias: Optional[str] = None) -> list:
     """Sort Key ["o.created_at DESC", "o.id"] → ["created_at DESC", "id"] (단순 컬럼만)."""
     out = []
     for k in keys or []:
-        k = k.strip()
-        m = re.match(r"^(?:([a-z_][a-z0-9_]*)\.)?([a-z_][a-z0-9_]*)(\s+(?:DESC|ASC))?(\s+NULLS\s+(?:FIRST|LAST))?$", k, re.I)
+        m = _SORTKEY.match(k.strip())
         if not m:
             return []           # 표현식 정렬은 인덱스 후보로 만들지 않음
-        if alias and m.group(1) and m.group(1) != alias:
+        if alias and m.group(1) and unquote_ident(m.group(1)) != alias:
             return []
-        out.append(m.group(2) + (m.group(3) or ""))
+        out.append(unquote_ident(m.group(2)) + (m.group(3) or "").upper())
     return out
+
+
+def _col_name(c: str) -> str:
+    """'created_at DESC' → 'created_at'"""
+    return re.sub(r"\s+(DESC|ASC)$", "", c, flags=re.I)
+
+
+def _col_sql(c: str) -> str:
+    base = _col_name(c)
+    return quote_ident(base) + c[len(base):]
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +306,9 @@ def rule_seq_scan_inefficient(node, parent, ctx, min_rows=1000):
         "Filter 컬럼에 인덱스 후보 → hypopg 로 플래너 채택 여부 검증.")
 
 
-_FUNC_ON_COL = re.compile(r"\b([a-z_]{2,})\s*\(\s*(?:[a-z_][a-z0-9_]*\.)?([a-z_][a-z0-9_]*)\s*\)")
+# 비교 연산자 왼쪽에 있는 func(col) 만 (우변 상수쪽 upper('abc') 같은 건 제외)
+_FUNC_ON_COL = re.compile(r'(?<![\w"$.])([A-Za-z_][A-Za-z0-9_]{1,})\s*\(\s*(?:' + _ID + r'\s*\.\s*)?(' + _ID
+                          + r')\s*\)\s*(?:=|<>|!=|<=|>=|<|>|~~|\bBETWEEN\b|\bIN\b|\bIS\b)', re.I)
 _FUNC_SKIP = {"not", "any", "all", "in", "exists", "and", "or"}
 
 
@@ -258,21 +316,23 @@ def rule_function_on_column(node, parent, ctx):
     filt = node.get("Filter")
     if not filt:
         return None
-    m = _FUNC_ON_COL.search(filt)
-    if not m or m.group(1) in _FUNC_SKIP:
+    m = _FUNC_ON_COL.search(normalize_cond(filt))
+    if not m or m.group(1).lower() in _FUNC_SKIP:
         return None
-    func, col = m.group(1), m.group(2)
+    func, col = m.group(1), unquote_ident(m.group(2))
     rel = qual_rel(node) or rel_label(node)
     return Finding(
         "function_on_column", "medium", node.get("Node Type", "Scan"), rel,
         f"Filter 에서 컬럼에 함수 적용: {func}({col}) — 일반 인덱스 / 파티션 프루닝 무효화",
         {"function": func, "column": col, "removed": rows_total(node, "Rows Removed by Filter"), "filter": filt},
         f"범위 조건으로 재작성 (예: date(col)=X → col >= X AND col < X + 1일). "
-        f"불가피하면 표현식 인덱스: CREATE INDEX ON {rel} (({func}({col}))).")
+        f"불가피하면 표현식 인덱스: CREATE INDEX ON {rel} (({func}({quote_ident(col)}))).")
 
 
 # 컬럼에 형변환이 붙어 인덱스를 못 타는 경우: ((col)::text = '...'::text)
-_CAST_ON_COL = re.compile(r"\(\(?(?:[a-z_][a-z0-9_]*\.)?([a-z_][a-z0-9_]*)\)?::([a-z][a-z ]*?)\s*(=|<>|<|>|<=|>=|~~)")
+_CAST_ON_COL = re.compile(r'\(\(?(?:' + _ID + r'\s*\.\s*)?(' + _ID + r')\)?::([a-z][a-z ]*?)\s*(=|<>|<|>|<=|>=|~~)', re.I)
+# 이 타입 → 이 캐스트는 인덱스 사용에 지장 없음 (binary-coercible / 같은 opfamily)
+_HARMLESS_CAST = {("character varying", "text"), ("text", "text"), ("name", "text")}
 
 
 def rule_implicit_cast(node, parent, ctx):
@@ -282,7 +342,12 @@ def rule_implicit_cast(node, parent, ctx):
     m = _CAST_ON_COL.search(filt)
     if not m:
         return None
-    col, typ = m.group(1), m.group(2).strip()
+    col, typ = unquote_ident(m.group(1)), m.group(2).strip().lower()
+    coltype = ctx.get("columns", {}).get(qual_rel(node) or "", {}).get(col)
+    if coltype is not None and (re.sub(r"\(.*\)", "", coltype), typ) in _HARMLESS_CAST:
+        return None          # varchar 컬럼의 ::text 는 플랜 표기일 뿐 인덱스 사용 가능
+    if coltype is None and typ == "text":
+        return None          # 타입을 모르면 가장 흔한 무해한 경우(varchar)로 보고 경고하지 않음
     return Finding(
         "implicit_cast_on_column", "medium", node["Node Type"], qual_rel(node),
         f"컬럼 {col} 이 {typ} 로 형변환되어 비교됨 — 컬럼 인덱스를 사용할 수 없음",
@@ -293,16 +358,16 @@ def rule_implicit_cast(node, parent, ctx):
 
 def rule_like_leading_wildcard(node, parent, ctx):
     filt = node.get("Filter") or ""
-    m = re.search(r"(?:\b[a-z_][a-z0-9_]*\.)?([a-z_][a-z0-9_]*)\)?(?:::text)?\s*~~\*?\s*'%", filt)
+    m = re.search(r'(?:' + _ID + r'\s*\.\s*)?(' + _ID + r')\)?(?:::[a-z ]+)?\s*~~\*?\s*\'%', filt, re.I)
     if not m:
         return None
-    col = m.group(1)
+    col = unquote_ident(m.group(1))
     rel = qual_rel(node) or rel_label(node)
     return Finding(
         "like_leading_wildcard", "medium", node.get("Node Type", "Scan"), rel,
         f"LIKE '%...' (앞쪽 와일드카드) 검색: {col} — B-tree 인덱스 사용 불가",
         {"column": col, "filter": filt},
-        f"pg_trgm GIN 인덱스: CREATE EXTENSION pg_trgm; CREATE INDEX ON {rel} USING gin ({col} gin_trgm_ops). "
+        f"pg_trgm GIN 인덱스: CREATE EXTENSION pg_trgm; CREATE INDEX ON {rel} USING gin ({quote_ident(col)} gin_trgm_ops). "
         f"또는 '...%' (접두 검색) 로 바꿀 수 있는지 검토.")
 
 
@@ -512,8 +577,12 @@ def partition_parent(dsn: Optional[str], relname: str) -> Optional[str]:
     if relname in _PARENT_CACHE:
         return _PARENT_CACHE[relname]
     try:
-        out = run_psql(dsn, f"SELECT pg_partition_root('{relname}'::regclass)::text;").strip()
-        parent = out if out and out != relname else None
+        out = run_psql(dsn, "SELECT n.nspname || '|' || c.relname FROM pg_class c "
+                            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                            "WHERE c.oid = pg_partition_root(to_regclass(:'r'));",
+                       {"r": relname}).strip()
+        parent = sqlguard.qualify(*out.split("|", 1)) if "|" in out else None
+        parent = parent if parent and parent != relname else None
     except Exception:
         parent = None
     _PARENT_CACHE[relname] = parent
@@ -569,9 +638,10 @@ def _join_key_for_alias(join_filter: Optional[str], alias: Optional[str]) -> lis
     if not join_filter or not alias:
         return []
     cols = []
-    for m in re.finditer(r"\b([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)\b", join_filter):
-        if m.group(1) == alias and m.group(2) not in cols:
-            cols.append(m.group(2))
+    for m in re.finditer(r'(?<![\w"$.])(' + _ID + r')\s*\.\s*(' + _ID + r')', normalize_cond(join_filter)):
+        a, c = unquote_ident(m.group(1)), unquote_ident(m.group(2))
+        if a == alias and c not in cols:
+            cols.append(c)
     return cols
 
 
@@ -582,14 +652,15 @@ def derive_index_candidates(findings: list) -> list:
                 if f.rule in ("function_on_column", "implicit_cast_on_column", "like_leading_wildcard")}
 
     def add(rel, cols, reason):
-        cols = [c for c in cols if (rel, c.split()[0]) not in unusable]
+        cols = [c for c in cols if (rel, _col_name(c)) not in unusable]
         if not rel or not cols:
             return
         key = (rel, tuple(cols))
         if key in seen:
             return
         seen.add(key)
-        cands.append(IndexCandidate(rel, list(cols), reason, f"CREATE INDEX ON {rel} ({', '.join(cols)})"))
+        cands.append(IndexCandidate(rel, list(cols), reason,
+                                    f"CREATE INDEX ON {rel} ({', '.join(_col_sql(c) for c in cols)})"))
 
     for f in findings:
         ev = f.evidence
@@ -607,7 +678,7 @@ def derive_index_candidates(findings: list) -> list:
             add(rel, icols + fcols, f"{ev.get('index')} 로 찾은 뒤 {ev.get('removed', 0):,}행을 Filter 로 버림")
         elif f.rule == "sort_for_limit":
             eq = equality_columns(ev.get("filter"))
-            keys = [k for k in ev.get("sort_key", []) if k.split()[0] not in eq]
+            keys = [k for k in ev.get("sort_key", []) if _col_name(k) not in eq]
             add(rel, eq + keys, f"LIMIT 을 위한 {ev.get('rows_sorted', 0):,}행 정렬 제거")
         elif f.rule == "nested_loop_many_loops" and f.relation:
             jcols = _join_key_for_alias(ev.get("join_filter"), ev.get("inner_alias")) \
@@ -658,21 +729,57 @@ def derive_hint_experiments(findings: list, root_plan: dict) -> list:
 # ---------------------------------------------------------------------------
 def _reltuples(dsn: Optional[str], plan: dict) -> dict:
     """추정 플랜(ANALYZE 없음)일 때 테이블 행수 참고용."""
-    rels = {qual_rel(n) for n in walk(plan) if qual_rel(n)}
+    rels = sorted({qual_rel(n) for n in walk(plan) if qual_rel(n)})
     if not dsn or not rels:
         return {}
     try:
-        lst = ",".join(f"'{r}'" for r in rels)
-        out = run_psql(dsn, f"SELECT c.oid::regclass::text, c.reltuples::bigint FROM pg_class c "
-                            f"WHERE c.oid::regclass::text IN ({lst});")
-        return {ln.split("|")[0]: int(float(ln.split("|")[1])) for ln in out.splitlines() if "|" in ln}
+        out = run_psql(dsn, "SELECT r, c.reltuples::bigint FROM jsonb_array_elements_text(:'rels'::jsonb) r "
+                            "JOIN pg_class c ON c.oid = to_regclass(r);", {"rels": json.dumps(rels)})
+        return {ln.rsplit("|", 1)[0]: int(float(ln.rsplit("|", 1)[1])) for ln in out.splitlines() if "|" in ln}
     except Exception:
         return {}
 
 
+def catalog_columns(dsn: Optional[str], rels: list) -> dict:
+    """{rel: {column: type}} — 후보 컬럼 검증 / 캐스트 판단용. 실패하면 {}."""
+    if not dsn or not rels:
+        return {}
+    try:
+        out = run_psql(dsn, """
+SELECT coalesce(jsonb_object_agg(r, cols), '{}') FROM (
+  SELECT r, jsonb_object_agg(a.attname, format_type(a.atttypid, a.atttypmod)) AS cols
+  FROM jsonb_array_elements_text(:'rels'::jsonb) r
+  JOIN pg_attribute a ON a.attrelid = to_regclass(r) AND a.attnum > 0 AND NOT a.attisdropped
+  GROUP BY r) x;""", {"rels": json.dumps(sorted(rels))})
+        return json.loads(out.strip() or "{}")
+    except Exception:
+        return {}
+
+
+def validate_candidates(cands: list, columns: dict) -> list:
+    """카탈로그에 없는 컬럼(파싱 오인)을 후보에서 제거. 카탈로그 정보가 없으면 그대로."""
+    out = []
+    for c in cands:
+        cols = columns.get(c.relation)
+        if cols is None:
+            out.append(c)
+            continue
+        keep = [x for x in c.columns if _col_name(x) in cols]
+        if not keep:
+            continue
+        if keep != c.columns:
+            c = IndexCandidate(c.relation, keep, c.reason,
+                               f"CREATE INDEX ON {c.relation} ({', '.join(_col_sql(x) for x in keep)})")
+        if all(c.ddl != o.ddl for o in out):
+            out.append(c)
+    return out
+
+
 def analyze_plan(root: dict, dsn: Optional[str] = None) -> dict:
     plan = root["Plan"]
-    ctx = {"exec_ms": root.get("Execution Time") or 0,
+    rels = sorted({qual_rel(n) for n in walk(plan) if qual_rel(n)})
+    columns = catalog_columns(dsn, rels)
+    ctx = {"exec_ms": root.get("Execution Time") or 0, "columns": columns,
            "reltuples": {} if has_actual(plan) else _reltuples(dsn, plan)}
     findings, hotspots = root_findings(root), []
     for node, parent in walk_parent(plan):
@@ -697,7 +804,7 @@ def analyze_plan(root: dict, dsn: Optional[str] = None) -> dict:
         "relations": sorted({qual_rel(n) for n in walk(plan) if qual_rel(n)}),
         "findings": [asdict(f) for f in findings],
         "hotspots": hotspots[:5],
-        "index_candidates": [asdict(c) for c in derive_index_candidates(findings)],
+        "index_candidates": [asdict(c) for c in validate_candidates(derive_index_candidates(findings), columns)],
         "hint_experiments": [asdict(h) for h in derive_hint_experiments(findings, plan)],
     }
 

@@ -33,6 +33,7 @@ import hint_verifier
 import stats_check
 import index_check
 import tunelog
+import pgexec
 from pg_tune_ai import orchestrator
 
 
@@ -177,7 +178,7 @@ def cmd_stats(a) -> int:
 
 
 def cmd_index_check(a) -> int:
-    issues = index_check.diagnose(a.dsn, a.min_scans)
+    issues = index_check.diagnose(a.dsn, a.min_scans, a.exact_bloat)
     print(json.dumps([asdict(i) for i in issues], ensure_ascii=False, indent=2) if a.format == "json"
           else index_check.format_report(issues))
     return 0
@@ -229,6 +230,8 @@ def cmd_ai(args) -> int:
 
 def build_parser():
     p = argparse.ArgumentParser(prog="pgtune", description="규칙 기반 PostgreSQL 쿼리 튜닝")
+    p.add_argument("--statement-timeout", help="모든 쿼리 statement_timeout (기본 5min, 예: 30s)")
+    p.add_argument("--lock-timeout", help="lock_timeout (기본 5s)")
     sub = p.add_subparsers(dest="command", required=True)
 
     def common(sp, need_sql=True, need_dsn=True):
@@ -269,6 +272,7 @@ def build_parser():
 
     c = sub.add_parser("index-check", help="DB 전체 인덱스 점검")
     common(c, need_sql=False); c.add_argument("--min-scans", type=int, default=50)
+    c.add_argument("--exact-bloat", action="store_true", help="pgstatindex 로 블로트 실측 (인덱스 전체 읽음)")
     c.set_defaults(func=cmd_index_check)
     ai = sub.add_parser("ai", help="진단 + 로컬 LLM(Ollama) 제안 + 검증 (선택 기능)")
     ai.add_argument("--dsn", required=True)
@@ -286,6 +290,7 @@ def build_parser():
 
 def main() -> int:
     args = build_parser().parse_args()
+    pgexec.set_timeouts(args.statement_timeout, args.lock_timeout)
     try:
         return args.func(args)
     except Exception as e:
