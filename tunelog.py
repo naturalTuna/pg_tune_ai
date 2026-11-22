@@ -21,12 +21,14 @@ from __future__ import annotations
 import hashlib
 import os
 import sys
+
+import sqlguard
 from datetime import datetime
 
 LOG_DIR = "pgtune_log"
 
 # 서브커맨드 → 파일명 접두(라벨)
-KIND_LABEL = {"analyze": "analyze", "verify": "verify", "tune": "tune"}
+KIND_LABEL = {"analyze": "analyze", "verify": "verify", "tune": "tune", "hint": "hint", "ai": "ai"}
 
 
 def query_id(source: str | None) -> str:
@@ -53,19 +55,20 @@ def write(kind: str, source: str | None, content: str,
     source  : 쿼리id 산출용 문자열 (보통 SQL, 없으면 plan-file 경로)
     content : 파일에 남길 본문 (사람용 리포트 + raw EXPLAIN 등)
     """
-    os.makedirs(LOG_DIR, exist_ok=True)
+    os.makedirs(LOG_DIR, mode=0o700, exist_ok=True)
     now = datetime.now()
     path = log_path(kind, source, now)
 
     head = ["=" * 64, f"[{now:%Y-%m-%d %H:%M:%S}] pgtune {kind}"]
     if dsn:
-        head.append(f"DSN : {dsn}")
+        head.append(f"DSN : {sqlguard.mask_dsn(dsn)}")      # 비밀번호는 로그에 남기지 않음
     if sql:
         head.append(f"SQL : {sql}")
     head.append("=" * 64)
 
     block = "\n".join(head) + "\n" + content.rstrip() + "\n\n"
-    with open(path, "a", encoding="utf-8") as f:
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)   # SQL/플랜이 들어가므로 0600
+    with os.fdopen(fd, "a", encoding="utf-8") as f:
         f.write(block)
 
     if echo:

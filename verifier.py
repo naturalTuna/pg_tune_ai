@@ -29,10 +29,12 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import subprocess
 import sys
 from dataclasses import dataclass, asdict
 from typing import Optional
+
+import pgexec
+import sqlguard
 
 
 @dataclass
@@ -49,19 +51,19 @@ class VerifyResult:
 # ---------------------------------------------------------------------------
 # psql 실행 헬퍼
 # ---------------------------------------------------------------------------
-def run_sql(dsn: str, sql: str) -> str:
-    proc = subprocess.run(
-        ["psql", dsn, "-At", "-X", "-q"],
-        input=sql, capture_output=True, text=True,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(f"psql 실패:\n{proc.stderr.strip()}")
-    return proc.stdout
+def run_sql(dsn: str, sql: str, variables: Optional[dict] = None) -> str:
+    return pgexec.run_psql(dsn, sql, variables)
+
+
+def _explain(sql: str, opts: str = "") -> str:
+    """대상 SQL 은 한 문장만, READ ONLY 트랜잭션 안에서 EXPLAIN (ANALYZE 없음) 후 ROLLBACK."""
+    stmt = sqlguard.single_statement(sql)
+    return pgexec.wrap_tx(f"EXPLAIN {opts}{stmt};", readonly=True)
 
 
 def explain_json(dsn: str, sql: str) -> dict:
     """EXPLAIN (ANALYZE 없이, FORMAT JSON). 가상 인덱스 검증용."""
-    out = run_sql(dsn, f"EXPLAIN (FORMAT JSON) {sql};")
+    out = run_sql(dsn, _explain(sql, "(FORMAT JSON) "))
     s, e = out.find("["), out.rfind("]")
     if s == -1 or e == -1:
         raise RuntimeError(f"플랜 JSON 파싱 실패:\n{out}")
@@ -70,13 +72,20 @@ def explain_json(dsn: str, sql: str) -> dict:
 
 def explain_text(dsn: str, sql: str) -> str:
     """plan-only 텍스트(트리) EXPLAIN — 로그/표시용 ('일반 EXPLAIN' 모습)."""
-    return run_sql(dsn, f"EXPLAIN {sql};").rstrip("\n")
+    out = run_sql(dsn, _explain(sql))
+    return "\n".join(ln for ln in out.splitlines() if ln.strip() not in {"BEGIN", "ROLLBACK"}).rstrip("\n")
+
+
+def hypopg_schema(dsn: str) -> Optional[str]:
+    """hypopg 가 설치된 스키마 (없으면 None). search_path 와 무관하게 호출하기 위해 사용."""
+    out = run_sql(dsn, "SELECT n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace "
+                       "WHERE e.extname = 'hypopg';").strip()
+    return out or None
 
 
 def hypopg_available(dsn: str) -> bool:
     """대상 DB 에 hypopg extension 이 설치(CREATE EXTENSION)돼 있는지."""
-    out = run_sql(dsn, "SELECT count(*) FROM pg_extension WHERE extname = 'hypopg';")
-    return out.strip() == "1"
+    return hypopg_schema(dsn) is not None
 
 
 class HypopgMissing(RuntimeError):
@@ -103,6 +112,25 @@ def uses_hypothetical(plan: dict) -> bool:
     return any(uses_hypothetical(c) for c in plan.get("Plans", []))
 
 
+def scan_on(plan: dict, rel: str) -> str:
+    """후보 테이블(rel)을 읽는 노드 타입. 없으면 main_scan."""
+    name = rel.split(".")[-1]
+    stack = [plan]
+    while stack:
+        n = stack.pop(0)
+        if n.get("Relation Name") == name and n.get("Node Type") != "ModifyTable":
+            return n.get("Node Type", "Unknown")
+        if n.get("Node Type") == "Bitmap Index Scan" and name in str(n.get("Index Name", "")):
+            return "Bitmap Index Scan"
+        stack.extend(n.get("Plans", []))
+    return main_scan(plan)
+
+
+def _ddl_rel(ddl: str) -> str:
+    m = re.search(r"\bON\s+([^\s(]+)", ddl, re.I)
+    return m.group(1) if m else ""
+
+
 def main_scan(plan: dict) -> str:
     """플랜에서 가장 바깥의 의미 있는 스캔/노드 타입을 뽑는다 (표시용)."""
     skip = {"Gather", "Gather Merge", "Result", "Append", "Sort", "Limit"}
@@ -120,30 +148,33 @@ def verify_candidate(dsn: str, sql: str, index_ddl: str,
     # capture(dict)를 넘기면 before/after 원본 플랜을 담아준다 (로그 기록용).
     # 0) hypopg 확인 — 없으면 hypopg_create_index 가 실패한 채로 EXPLAIN 만 돌아
     #    "미채택(효과 없음)" 으로 잘못 판정되므로 먼저 막는다.
-    if not hypopg_available(dsn):
+    # 형식 검사: 인덱스 정의 한 문장 / 대상 SQL 한 문장 (LLM·사용자 입력 모두)
+    index_ddl = sqlguard.index_ddl(index_ddl)
+    sql = sqlguard.single_statement(sql)
+    hs = hypopg_schema(dsn)
+    if hs is None:
         raise HypopgMissing(HYPOPG_MISSING_MSG)
+    hq = sqlguard.quote_ident(hs)
     # 1) 원본
     before = explain_json(dsn, sql)
     base_cost = top_cost(before)
-    scan_before = main_scan(before)
+    scan_before = scan_on(before, _ddl_rel(index_ddl))
     # 로그용 텍스트 EXPLAIN(원본)은 capture 요청 시에만 추가로 받아온다
     before_text = explain_text(dsn, sql) if capture is not None else ""
 
     # 2) 가상 인덱스 생성 + 3) 재측정  (같은 세션이어야 가상인덱스가 유지됨)
     #    같은 세션에서 텍스트 EXPLAIN 과 JSON EXPLAIN 을 둘 다 받아온다.
     #    (after 텍스트는 가상 인덱스가 살아있는 이 세션 안에서만 뽑을 수 있음)
-    dollar = f"$pgtune${index_ddl}$pgtune$"
+    #    인덱스 DDL 은 psql 변수(:'ddl')로 넘겨 문자열 탈출 불가. 전부 READ ONLY 트랜잭션 안.
     M_TXT, M_JSON = "__PGT_AFTER_TXT__", "__PGT_AFTER_JSON__"
-    script = (
-        "\\set ON_ERROR_STOP on\n"          # 가상 인덱스 생성 실패 시 즉시 오류로 처리
-        f"SELECT hypopg_create_index({dollar});\n"
+    script = pgexec.wrap_tx(
+        f"SELECT {hq}.hypopg_create_index(:'ddl');\n"
         f"SELECT '{M_TXT}';\n"
         f"EXPLAIN {sql};\n"
         f"SELECT '{M_JSON}';\n"
         f"EXPLAIN (FORMAT JSON) {sql};\n"
-        f"SELECT hypopg_reset();\n"
-    )
-    out = run_sql(dsn, script)
+        f"SELECT {hq}.hypopg_reset();", readonly=True)
+    out = run_sql(dsn, script, {"ddl": index_ddl})
     i_txt, i_json = out.rfind(M_TXT), out.rfind(M_JSON)
     if i_json == -1:
         raise RuntimeError(f"가상 인덱스 EXPLAIN 파싱 실패:\n{out}")
@@ -157,7 +188,7 @@ def verify_candidate(dsn: str, sql: str, index_ddl: str,
 
     indexed_cost = top_cost(after)
     adopted = uses_hypothetical(after)
-    scan_after = main_scan(after)
+    scan_after = scan_on(after, _ddl_rel(index_ddl))
     improvement = (1 - indexed_cost / base_cost) * 100 if base_cost else 0.0
 
     if capture is not None:

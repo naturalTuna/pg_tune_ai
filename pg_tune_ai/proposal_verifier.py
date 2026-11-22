@@ -16,6 +16,8 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
+import pgexec
+import sqlguard
 import verifier  # 상위 디렉터리 verifier.py (hypopg 인덱스 검증 재사용)
 
 
@@ -36,27 +38,35 @@ class VerifiedProposal:
     explain_after: str = ""           # 로그용: 적용 후 EXPLAIN(텍스트)
 
 
-def _explain_text(dsn: str, sql: str, pre: str = "") -> str:
-    """plan-only 텍스트 EXPLAIN. pre(SET 등) 적용 후, BEGIN/ROLLBACK 으로 격리."""
-    script = "\\set ON_ERROR_STOP on\nBEGIN;\n"
-    if pre:
-        script += pre.rstrip(";") + ";\n"
-    script += f"EXPLAIN {sql};\nROLLBACK;\n"
-    out = verifier.run_sql(dsn, script)
-    # BEGIN/ROLLBACK 등 잡음 줄 제거하고 플랜 줄만 남긴다
+def _set_script(settings: dict | None) -> tuple:
+    """화이트리스트 검사를 통과한 설정만 set_config(:'k', :'v', true) 로 (값은 psql 변수)."""
+    lines, vars_ = [], {}
+    for i, (k, v) in enumerate((settings or {}).items()):
+        k, v = sqlguard.guc_setting(k, v)
+        vars_[f"k{i}"], vars_[f"v{i}"] = k, v
+        lines.append(f"SELECT set_config(:'k{i}', :'v{i}', true);")
+    return "\n".join(lines), vars_
+
+
+def _run_explain(dsn: str, sql: str, settings: dict | None, opts: str) -> str:
+    """LLM / 사용자 SQL 을 READ ONLY 트랜잭션 안에서 EXPLAIN (실행 안 함) 후 ROLLBACK.
+    sql 은 한 문장만 (sqlguard), 설정은 화이트리스트만."""
+    stmt = sqlguard.single_statement(sql)
+    pre, vars_ = _set_script(settings)
+    body = (pre + "\n" if pre else "") + f"EXPLAIN {opts}{stmt};"
+    return verifier.run_sql(dsn, pgexec.wrap_tx(body, readonly=True), vars_)
+
+
+def _explain_text(dsn: str, sql: str, settings: dict | None = None) -> str:
+    out = _run_explain(dsn, sql, settings, "")
     keep = [ln for ln in out.splitlines()
-            if ln and ln.strip() not in ("BEGIN", "ROLLBACK", "SET")]
+            if ln and ln.strip() not in ("BEGIN", "ROLLBACK", "SET") and not ln.startswith(tuple(
+                str(v) for v in (settings or {}).values()))]
     return "\n".join(keep).rstrip()
 
 
-def _explain_cost(dsn: str, sql: str, pre: str = "") -> float:
-    """pre(SET 등) 적용 후 sql 의 EXPLAIN 총 cost. BEGIN/ROLLBACK 으로 격리.
-    ON_ERROR_STOP 으로 잘못된 SQL(재작성 환각 등)의 진짜 에러를 표면화한다."""
-    script = "\\set ON_ERROR_STOP on\nBEGIN;\n"
-    if pre:
-        script += pre.rstrip(";") + ";\n"
-    script += f"EXPLAIN (FORMAT JSON) {sql};\nROLLBACK;\n"
-    out = verifier.run_sql(dsn, script)   # SQL 오류면 여기서 RuntimeError(psql stderr)
+def _explain_cost(dsn: str, sql: str, settings: dict | None = None) -> float:
+    out = _run_explain(dsn, sql, settings, "(FORMAT JSON) ")
     s, e = out.find("["), out.rfind("]")
     if s == -1 or e == -1:
         raise RuntimeError(f"EXPLAIN 결과를 파싱하지 못함:\n{out}")
@@ -86,11 +96,12 @@ def verify_index(dsn: str, sql: str, p) -> VerifiedProposal:
 def verify_config(dsn: str, sql: str, p, baseline: float | None = None) -> VerifiedProposal:
     detail = ", ".join(f"{k}={v}" for k, v in p.set.items())
     try:
+        for k, v in p.set.items():
+            sqlguard.guc_setting(k, v)            # 허용 안 된 설정이면 여기서 실패 처리
         base = baseline if baseline is not None else _explain_cost(dsn, sql)
-        sets = " ".join(f"SET LOCAL {k} = '{v}';" for k, v in p.set.items())
-        new = _explain_cost(dsn, sql, pre=sets)
+        new = _explain_cost(dsn, sql, p.set)
         eb = _explain_text(dsn, sql)
-        ea = _explain_text(dsn, sql, pre=sets)
+        ea = _explain_text(dsn, sql, p.set)
     except Exception as e:
         return VerifiedProposal("config", detail, p.rationale, ok=False, error=str(e))
     return VerifiedProposal(
@@ -102,10 +113,11 @@ def verify_config(dsn: str, sql: str, p, baseline: float | None = None) -> Verif
 
 def verify_rewrite(dsn: str, sql: str, p, baseline: float | None = None) -> VerifiedProposal:
     try:
+        rewritten = sqlguard.readonly_query(p.sql)   # 조회 전용 한 문장만 (쓰기/다중문 차단)
         base = baseline if baseline is not None else _explain_cost(dsn, sql)
-        new = _explain_cost(dsn, p.sql)   # 재작성 SQL 이 일단 계획이 잡히는지도 검증
+        new = _explain_cost(dsn, rewritten)   # 재작성 SQL 이 일단 계획이 잡히는지도 검증
         eb = _explain_text(dsn, sql)
-        ea = _explain_text(dsn, p.sql)
+        ea = _explain_text(dsn, rewritten)
     except Exception as e:
         return VerifiedProposal("rewrite", p.sql, p.rationale, ok=False,
                                 human_check=True, error=str(e))
