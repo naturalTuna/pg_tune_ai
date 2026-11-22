@@ -144,7 +144,7 @@ GitHub Actions 에서 PostgreSQL 16 + hypopg 로 자동 실행됩니다.
 | Q3 `"Region" = 3 AND amt > 990` | 14.54 | 0.09 | 0.10 |
 | Q4 `JOIN customers ... grade = 'V'` | 25.84 | 3.32 | 3.34 |
 | Q5 `date(created_at) = ...` | 15.15 | **0.23** (표현식 인덱스 검증) | 16.69 (추천 없음) |
-| Q6 `note LIKE '%abc1%'` | 24.56 | 24.97 (진단: pg_trgm GIN 권고) | 24.46 (최적화 불가로 표시) |
+| Q6 `note LIKE '%abc1%'` | 24.56 | 26.97 (진단: pg_trgm GIN 권고) | 24.46 (최적화 불가로 표시) |
 
 - 일반 B-tree 후보 4개는 두 도구 추천이 같음
 - pg_tune_ai 만: 표현식 인덱스(hypopg 검증), 규칙 진단(함수/LIKE/캐스트 등)과 쿼리 수정 권고, pg_hint_plan / SET 실험
