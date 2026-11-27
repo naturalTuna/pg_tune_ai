@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 naturalTuna — https://github.com/naturalTuna/pg_tune_ai
 """
 sqlguard.py  —  psql 스크립트에 들어가는 SQL 문자열 검사 (표준 라이브러리만)
 

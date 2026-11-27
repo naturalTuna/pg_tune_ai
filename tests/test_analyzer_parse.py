@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 naturalTuna — https://github.com/naturalTuna/pg_tune_ai
 """analyzer 조건식 파싱 / 규칙 단위 테스트 (DB 불필요)."""
 import os
 import sys

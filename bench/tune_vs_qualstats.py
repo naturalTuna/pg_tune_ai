@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 naturalTuna — https://github.com/naturalTuna/pg_tune_ai
 # 실행: 대상 DB 에 pg_qualstats(shared_preload_libraries) + hypopg 설치, bench/setup.sql 적재 후
 #   BENCH_DSN="host=... dbname=cmp" python3 bench/tune_vs_qualstats.py
 """pg_tune_ai vs pg_qualstats_index_advisor — 같은 쿼리 6개, 추천 인덱스를 실제로 만들어 실행시간 비교."""
