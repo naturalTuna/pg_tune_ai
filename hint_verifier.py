@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 naturalTuna — https://github.com/naturalTuna/pg_tune_ai
 """
 hint_verifier.py  —  실행계획 대안 / 설정 실험 (pg_hint_plan, SET)
 

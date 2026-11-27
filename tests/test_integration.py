@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 naturalTuna — https://github.com/naturalTuna/pg_tune_ai
 """실제 PostgreSQL 통합 테스트.
 
   PGTUNE_TEST_DSN="host=/tmp port=5432 user=postgres dbname=postgres" python3 -m unittest tests.test_integration

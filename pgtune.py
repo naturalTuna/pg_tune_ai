@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 naturalTuna — https://github.com/naturalTuna/pg_tune_ai
 """
 pgtune.py  —  규칙 기반 PostgreSQL 쿼리 튜닝 (AI 없음, 표준 라이브러리 + psql 만 사용)
 

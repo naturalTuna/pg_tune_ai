@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 naturalTuna — https://github.com/naturalTuna/pg_tune_ai
 """
 proposal_verifier.py — LLM proposals 를 실제 플래너로 검증 (환각 차단)
 

@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 naturalTuna — https://github.com/naturalTuna/pg_tune_ai
 """pg_tune_ai — pg_tune 의 LLM 보조 계층 (Ollama 로컬 모델).
 
 설계 원칙

@@ -164,3 +164,10 @@ GitHub Actions 에서 PostgreSQL 16 + hypopg 로 자동 실행됩니다.
 
 (Dexter 는 이 환경에서 rubygems 접근이 막혀 실측하지 못함)
 워크로드 단위(Top N 쿼리 일괄) 분석은 아직 없음 — pg_qualstats 대비 다음 개선 후보.
+
+## License
+
+MIT License — Copyright (c) 2026 naturalTuna (https://github.com/naturalTuna/pg_tune_ai)
+
+저작권 표기와 라이선스 문구(`LICENSE`)를 남기면 누구나 사용·수정·재배포할 수 있습니다.
+코드 파일 상단의 `SPDX-License-Identifier: MIT` / `Copyright (c) 2026 naturalTuna` 줄을 지우지 마세요.
